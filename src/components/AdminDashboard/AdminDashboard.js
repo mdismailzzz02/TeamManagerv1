@@ -14,7 +14,9 @@ import {
   runExperimentalAI,
   getAIAnalysisSuggestions,
   getAIInsightsDashboard,
-  testBackendVersion
+  testBackendVersion,
+  applyFrontendSmartStatus,
+  fixShiftStatus
 } from '../../services/appScriptAPI';
 
 const AdminDashboard = () => {
@@ -426,11 +428,32 @@ const AdminDashboard = () => {
       }
       
       if (shiftsResponse.success && staffResponse.success) {
-        setSummaryData(shiftsResponse.data);
+        // ✅ VALIDATE AND FIX STATUS INCONSISTENCIES BEFORE PROCESSING
+        console.log('🔄 ADMIN SUMMARY TAB: Running validation-detection-fix cycle...');
+        const validationResult = await validateAndFixShiftStatuses(shiftsResponse.data);
+        
+        let finalShiftsData = shiftsResponse.data;
+        
+        if (validationResult.needsRefresh) {
+          console.log(`🔄 ADMIN SUMMARY TAB RE-FETCHING: ${validationResult.fixedCount} shifts fixed, getting fresh data...`);
+          
+          const freshShiftsResponse = await getShifts({
+            startDate: dateRange.start,
+            endDate: dateRange.end,
+            forceRefresh: true
+          });
+          
+          if (freshShiftsResponse.success) {
+            finalShiftsData = freshShiftsResponse.data;
+            setMessage(`✅ ${validationResult.fixedCount} shift status(es) corrected in Google Sheets`);
+          }
+        }
+        
+        setSummaryData(finalShiftsData);
         
         // Process into calendar format
         const { calendar, employees, dates } = processCalendarData(
-          shiftsResponse.data, 
+          finalShiftsData, 
           staffResponse.data, 
           dateRange, 
           showDrafts,
@@ -440,7 +463,9 @@ const AdminDashboard = () => {
         setCalendarData({ calendar, employees, dates, dateRange });
         setActiveEmployees(employees);
         
-        setMessage(`Summary loaded: ${shiftsResponse.data.length} shifts for ${employees.length} employees`);
+        if (!validationResult.needsRefresh) {
+          setMessage(`Summary loaded: ${finalShiftsData.length} shifts for ${employees.length} employees`);
+        }
       } else {
         setMessage('Failed to load summary data');
       }
@@ -686,12 +711,14 @@ const AdminDashboard = () => {
     const currentDateTime = now.getTime();
     console.log('⏰ Current date/time:', now.toLocaleString(), 'timestamp:', currentDateTime);
     
-    // Parse shift date to create proper date/time comparisons
+    // Parse shift date
     let shiftDateObj;
     if (shiftDate) {
-      // Handle different date formats
-      if (shiftDate.includes('/')) {
-        // Format: MM/DD/YYYY or similar
+      // Handle ISO 8601 format: "2025-10-29T18:30:00.000Z"
+      if (shiftDate.includes('T') && shiftDate.includes('Z')) {
+        shiftDateObj = new Date(shiftDate);
+      } else if (shiftDate.includes('/')) {
+        // Format: MM/DD/YYYY or DD/MM/YYYY
         shiftDateObj = new Date(shiftDate);
       } else if (shiftDate.includes(',')) {
         // Format: "Oct 8, 2025"
@@ -710,27 +737,78 @@ const AdminDashboard = () => {
     
     console.log('📅 Shift date:', shiftDateObj.toDateString());
     
-    // 🚨 DATE-AWARE STATUS VALIDATION
+    // 🚨 DATE-AWARE STATUS VALIDATION (Compare dates properly, not strings!)
     const today = new Date();
-    const isShiftFromPast = shiftDateObj.toDateString() < today.toDateString();
-    const isShiftFromFuture = shiftDateObj.toDateString() > today.toDateString();
-    const isShiftToday = shiftDateObj.toDateString() === today.toDateString();
+    today.setHours(0, 0, 0, 0); // Normalize to start of day
+    
+    const shiftDateNormalized = new Date(shiftDateObj);
+    shiftDateNormalized.setHours(0, 0, 0, 0); // Normalize to start of day
+    
+    const isShiftFromPast = shiftDateNormalized < today;
+    const isShiftFromFuture = shiftDateNormalized > today;
+    const isShiftToday = shiftDateNormalized.getTime() === today.getTime();
+    
+    // Calculate day difference for overnight shift detection
+    let dayDifference = 0;
+    if (isShiftFromPast) {
+      dayDifference = Math.floor((today - shiftDateNormalized) / (1000 * 60 * 60 * 24));
+    }
     
     console.log(`📅 Date Analysis: Shift=${shiftDateObj.toDateString()}, Today=${today.toDateString()}`);
     console.log(`📅 isPast=${isShiftFromPast}, isFuture=${isShiftFromFuture}, isToday=${isShiftToday}`);
     
     if (isShiftFromPast) {
-      // For past dates, shifts can only be COMPLETED or DRAFT (never ACTIVE)
-      const hasActiveSegment = parsedSegments.some(seg => !seg.endTime);
-      if (hasActiveSegment) {
-        console.log('🚨 PAST DATE with active segment - forcing COMPLETED');
-        return 'COMPLETED';
-      } else if (parsedSegments.length > 0 && parsedSegments.every(seg => seg.endTime)) {
-        console.log('🎯 Past shift with complete segments - COMPLETED');
-        return 'COMPLETED';
+      // 🌙 OVERNIGHT SHIFT CHECK: If date is exactly 1 day ago, might still be active
+      const dayDifference = Math.floor((today - shiftDateNormalized) / (1000 * 60 * 60 * 24));
+      
+      if (dayDifference === 1 && parsedSegments.length > 0) {
+        // Check if shift ends in early morning (overnight shift indicator)
+        const lastSegment = parsedSegments[parsedSegments.length - 1];
+        const lastEndTime = lastSegment?.endTime;
+        
+        if (lastEndTime) {
+          const [endHour] = lastEndTime.split(':').map(Number);
+          const [currentHour] = currentTime.split(':').map(Number);
+          
+          // If shift ends between midnight and 8 AM, it's likely an overnight shift
+          if (endHour >= 0 && endHour <= 8) {
+            // If current time is before shift end time in early morning
+            if (currentHour >= 0 && currentHour <= 8 && currentHour < endHour) {
+              console.log(`🌙 OVERNIGHT SHIFT STILL ACTIVE: Ends at ${lastEndTime}, current ${currentTime} - continuing to time-based logic`);
+              // Don't return here - let the time-based logic below handle it as "today's shift"
+            } else {
+              // Overnight shift has ended
+              console.log('🎯 Overnight shift ended - COMPLETED');
+              return 'COMPLETED';
+            }
+          } else {
+            // Normal past date logic
+            const hasActiveSegment = parsedSegments.some(seg => !seg.endTime);
+            if (hasActiveSegment) {
+              console.log('🚨 PAST DATE with active segment - forcing COMPLETED');
+              return 'COMPLETED';
+            } else if (parsedSegments.every(seg => seg.endTime)) {
+              console.log('🎯 Past shift with complete segments - COMPLETED');
+              return 'COMPLETED';
+            } else {
+              console.log('🎯 Past shift with incomplete data - DRAFT');
+              return 'DRAFT';
+            }
+          }
+        }
       } else {
-        console.log('🎯 Past shift with incomplete data - DRAFT');
-        return 'DRAFT';
+        // More than 1 day ago - definitely past
+        const hasActiveSegment = parsedSegments.some(seg => !seg.endTime);
+        if (hasActiveSegment) {
+          console.log('🚨 PAST DATE with active segment - forcing COMPLETED');
+          return 'COMPLETED';
+        } else if (parsedSegments.length > 0 && parsedSegments.every(seg => seg.endTime)) {
+          console.log('🎯 Past shift with complete segments - COMPLETED');
+          return 'COMPLETED';
+        } else {
+          console.log('🎯 Past shift with incomplete data - DRAFT');
+          return 'DRAFT';
+        }
       }
     } else if (isShiftFromFuture) {
       // For future dates, shifts can only be DRAFT or OFFLINE (never ACTIVE/COMPLETED)
@@ -738,8 +816,8 @@ const AdminDashboard = () => {
       return 'DRAFT';
     }
     
-    // For today's shifts, continue with normal time-based logic
-    if (!isShiftToday) {
+    // For today's shifts (or overnight shifts continuing into today), continue with normal time-based logic
+    if (!isShiftToday && !(isShiftFromPast && dayDifference === 1)) {
       console.log('🎯 Not today\'s shift - defaulting to DRAFT');
       return 'DRAFT';
     }
@@ -901,6 +979,102 @@ const AdminDashboard = () => {
     console.log('===============================');
     
     return normalized;
+  };
+
+  /**
+   * VALIDATION & STATUS CORRECTION CYCLE (Exact copy from Staff History)
+   * Validates shifts and fixes status inconsistencies in Google Sheets
+   * Returns: { shifts: originalShifts, fixedCount: number, needsRefresh: boolean }
+   */
+  const validateAndFixShiftStatuses = async (shiftsData) => {
+    console.log(`📅 ADMIN VALIDATION: Received ${shiftsData.length} shifts - Checking for status inconsistencies`);
+    
+    let fixedShiftsCount = 0;
+    const shiftsToFix = [];
+    
+    // 🏗️ DETECT: Check each shift for status inconsistencies
+    for (const shift of shiftsData) {
+      // 🔧 Handle both backend formats: camelCase (getDashboardData) and Pascal Case (getAllShiftsForAdmin)
+      const shiftId = shift.shiftId || shift['Shift ID'];
+      const status = shift.status || shift['Status'];
+      const shiftDate = shift.shiftDate || shift['Shift Date'];
+      const firstStartTime = shift.firstStartTime || shift['First Start Time'];
+      const lastEndTime = shift.lastEndTime || shift['Last End Time'];
+      const segments = shift.segments || shift['Segments Data'];
+      
+      console.log(`🔍 ADMIN CHECKING SHIFT ${shiftId}:`, {
+        originalStatus: status,
+        shiftDate: shiftDate,
+        startTime: firstStartTime,
+        endTime: lastEndTime
+      });
+      
+      // Convert Admin format to Staff format for validation
+      const shiftForValidation = {
+        shiftId: shiftId,
+        status: status,
+        shiftDate: shiftDate,
+        firstStartTime: firstStartTime,
+        lastEndTime: lastEndTime,
+        segments: segments
+      };
+      
+      const smartStatus = applyFrontendSmartStatus(shiftForValidation);
+      console.log(`📊 ADMIN SMART STATUS RESULT:`, {
+        shiftId: shiftId,
+        originalStatus: status,
+        smartStatus: smartStatus.status,
+        statusCorrected: smartStatus._statusCorrected,
+        reason: smartStatus._correctionReason
+      });
+      
+      if (smartStatus._statusCorrected) {
+        console.log(`❌ ADMIN STATUS INCONSISTENCY DETECTED:`, {
+          shiftId: shiftId,
+          originalStatus: status,
+          correctedStatus: smartStatus.status,
+          reason: smartStatus._correctionReason
+        });
+        
+        shiftsToFix.push({
+          shiftId: shiftId,
+          correctedStatus: smartStatus.status,
+          reason: smartStatus._correctionReason
+        });
+      }
+    }
+    
+    // 🔧 FIX: Fix inconsistencies in Google Sheets
+    if (shiftsToFix.length > 0) {
+      console.log(`🔧 ADMIN FIXING ${shiftsToFix.length} STATUS INCONSISTENCIES IN GOOGLE SHEETS...`);
+      
+      for (const fixData of shiftsToFix) {
+        try {
+          const fixResponse = await fixShiftStatus({
+            shiftId: fixData.shiftId,
+            correctStatus: fixData.correctedStatus,
+            reason: fixData.reason
+          });
+          
+          if (fixResponse.success) {
+            console.log(`✅ ADMIN FIXED SHIFT ${fixData.shiftId} in Google Sheets`);
+            fixedShiftsCount++;
+          } else {
+            console.error(`❌ ADMIN FAILED to fix shift ${fixData.shiftId}:`, fixResponse.message);
+          }
+        } catch (error) {
+          console.error(`❌ ADMIN ERROR fixing shift ${fixData.shiftId}:`, error);
+        }
+      }
+    } else {
+      console.log('✅ ADMIN VALIDATION: All shift statuses are correct');
+    }
+    
+    return {
+      shifts: shiftsData,
+      fixedCount: fixedShiftsCount,
+      needsRefresh: fixedShiftsCount > 0
+    };
   };
 
   // View Type configurations for column filtering
@@ -1078,8 +1252,28 @@ const AdminDashboard = () => {
         startDate: new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString().split('T')[0], // Last 7 days
         endDate: new Date().toISOString().split('T')[0]
       });
+      
       if (shiftsResponse.success) {
-        setAllShifts(shiftsResponse.data);
+        // ✅ VALIDATE AND FIX STATUS INCONSISTENCIES
+        console.log('🔄 ADMIN DASHBOARD: Running validation-detection-fix cycle...');
+        const validationResult = await validateAndFixShiftStatuses(shiftsResponse.data);
+        
+        if (validationResult.needsRefresh) {
+          console.log(`🔄 ADMIN DASHBOARD RE-FETCHING: ${validationResult.fixedCount} shifts fixed, getting fresh data...`);
+          
+          const freshShiftsResponse = await getShifts({ 
+            startDate: new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString().split('T')[0],
+            endDate: new Date().toISOString().split('T')[0],
+            forceRefresh: true
+          });
+          
+          if (freshShiftsResponse.success) {
+            setAllShifts(freshShiftsResponse.data);
+            setMessage(`✅ ${validationResult.fixedCount} shift status(es) corrected in Google Sheets`);
+          }
+        } else {
+          setAllShifts(shiftsResponse.data);
+        }
       }
 
       // Load staff list
@@ -1990,23 +2184,45 @@ const AdminDashboard = () => {
       });
       
       if (response.success) {
+        // ✅ VALIDATE AND FIX STATUS INCONSISTENCIES BEFORE PROCESSING
+        console.log('🔄 ADMIN SHIFTS TAB: Running validation-detection-fix cycle...');
+        const validationResult = await validateAndFixShiftStatuses(response.data);
+        
+        let dataToProcess = response.data;
+        
+        if (validationResult.needsRefresh) {
+          console.log(`🔄 ADMIN SHIFTS TAB RE-FETCHING: ${validationResult.fixedCount} shifts fixed, getting fresh data...`);
+          
+          const freshResponse = await makeAPICall({
+            action: 'getAllShiftsForAdmin',
+            startDate: dateRange.start,
+            endDate: dateRange.end,
+            forceRefresh: true
+          });
+          
+          if (freshResponse.success) {
+            dataToProcess = freshResponse.data;
+            setMessage(`✅ ${validationResult.fixedCount} shift status(es) corrected and ${freshResponse.data.length} shifts loaded`);
+          }
+        }
+        
         // Hold raw data for debugging, and normalized data for display
-        setRawShiftsData(response.data);
+        setRawShiftsData(dataToProcess);
         console.log('=== DEBUG: Backend Response ===');
-        console.log('Raw data length:', response.data.length);
-        if (response.data.length > 0) {
-          console.log('First record keys:', Object.keys(response.data[0]));
-          console.log('First record:', response.data[0]);
+        console.log('Raw data length:', dataToProcess.length);
+        if (dataToProcess.length > 0) {
+          console.log('First record keys:', Object.keys(dataToProcess[0]));
+          console.log('First record:', dataToProcess[0]);
         }
         
         // Apply smart status calculation to each record
         const normalizedData = [];
         const statusUpdates = [];
         
-        console.log('🚀 Starting normalization loop for', response.data.length, 'records');
+        console.log('🚀 Starting normalization loop for', dataToProcess.length, 'records');
         
         try {
-          for (const rec of response.data) {
+          for (const rec of dataToProcess) {
             console.log('📝 Processing record:', rec['Shift ID']);
             
             try {
@@ -2074,7 +2290,10 @@ const AdminDashboard = () => {
         
         setShiftsData(normalizedData);
         setShowShiftsTable(true);
-        setMessage(`Loaded ${response.data.length} shifts for ${timePeriodOptions.find(o => o.value === shiftsTimePeriod)?.label}`);
+        
+        if (!validationResult.needsRefresh) {
+          setMessage(`Loaded ${dataToProcess.length} shifts for ${timePeriodOptions.find(o => o.value === shiftsTimePeriod)?.label}`);
+        }
       } else {
         setError(response.message || 'Failed to fetch shifts data.');
       }
@@ -2650,17 +2869,39 @@ const AdminDashboard = () => {
       });
       
       if (response.success) {
+        // ✅ VALIDATE AND FIX STATUS INCONSISTENCIES BEFORE PROCESSING
+        console.log('🔄 ADMIN OVERVIEW TAB: Running validation-detection-fix cycle...');
+        const validationResult = await validateAndFixShiftStatuses(response.data);
+        
+        let dataToProcess = response.data;
+        
+        if (validationResult.needsRefresh) {
+          console.log(`🔄 ADMIN OVERVIEW TAB RE-FETCHING: ${validationResult.fixedCount} shifts fixed, getting fresh data...`);
+          
+          const freshResponse = await makeAPICall({
+            action: 'getAllShiftsForAdmin',
+            startDate: dateRange.start,
+            endDate: dateRange.end,
+            forceRefresh: true
+          });
+          
+          if (freshResponse.success) {
+            dataToProcess = freshResponse.data;
+            setMessage(`✅ ${validationResult.fixedCount} shift status(es) corrected and ${freshResponse.data.length} shifts loaded`);
+          }
+        }
+        
         console.log('🔍 === OVERVIEW SECTION: Smart Status Processing ===');
-        console.log('Overview data received:', response.data.length, 'records');
+        console.log('Overview data received:', dataToProcess.length, 'records');
         
         // Apply smart status calculation and sync with backend
         const normalizedData = [];
         const statusUpdates = [];
         
-        console.log('🚀 Starting overview normalization loop for', response.data.length, 'records');
+        console.log('🚀 Starting overview normalization loop for', dataToProcess.length, 'records');
         
         try {
-          for (const rec of response.data) {
+          for (const rec of dataToProcess) {
             console.log('📝 Overview processing record:', rec['Shift ID']);
             
             try {

@@ -532,9 +532,14 @@ export const applyFrontendSmartStatus = (shiftData) => {
     
     console.log(`📅 DATE COMPARISON DEBUG: shiftDate="${shiftDate}" vs today="${today}"`);
     
-    // Convert DD/MM/YYYY to YYYY-MM-DD for proper comparison if needed
+    // Normalize shift date for comparison
     let normalizedShiftDate = shiftDate;
-    if (shiftDate.includes('/')) {
+    
+    if (shiftDate.includes('T') && shiftDate.includes('Z')) {
+      // ISO 8601 format: "2025-10-29T18:30:00.000Z"
+      normalizedShiftDate = new Date(shiftDate).toISOString().split('T')[0];
+      console.log(`📅 ISO FORMAT EXTRACTED: "${shiftDate}" → "${normalizedShiftDate}"`);
+    } else if (shiftDate.includes('/')) {
       // Assuming DD/MM/YYYY format, convert to YYYY-MM-DD
       const [day, month, year] = shiftDate.split('/');
       normalizedShiftDate = `${year}-${month.padStart(2, '0')}-${day.padStart(2, '0')}`;
@@ -555,7 +560,21 @@ export const applyFrontendSmartStatus = (shiftData) => {
     console.log(`✅ DATE CHECK PASSED: ${normalizedShiftDate} <= ${today} - Continuing with time-based logic`);
   }
   
-  const segments = shiftData.segments;
+  // 🔧 FIX: Ensure segments is an array (might come as JSON string from backend)
+  let segments = shiftData.segments;
+  if (typeof segments === 'string') {
+    try {
+      segments = JSON.parse(segments);
+    } catch (e) {
+      console.error('Failed to parse segments JSON string:', e);
+      segments = [];
+    }
+  }
+  if (!Array.isArray(segments)) {
+    console.warn('Segments is not an array, converting to empty array');
+    segments = [];
+  }
+  
   const now = new Date();
   const currentTime = now.toLocaleTimeString('en-US', { 
     hour12: false, 
@@ -563,19 +582,56 @@ export const applyFrontendSmartStatus = (shiftData) => {
     minute: '2-digit' 
   });
   
-  // 🚨 CRITICAL: Check if shift is from a past date
+  // 🚨 CRITICAL: Check if shift is from a past date (with overnight shift support)
   if (shiftData.shiftDate) {
     const today = new Date().toISOString().split('T')[0];
     let normalizedShiftDate = shiftData.shiftDate;
-    if (shiftData.shiftDate.includes('/')) {
+    
+    // 🌍 TIMEZONE-SAFE: Extract date portion without timezone conversion
+    if (shiftData.shiftDate.includes('T') && shiftData.shiftDate.includes('Z')) {
+      // ISO 8601 format: Extract just date part
+      normalizedShiftDate = shiftData.shiftDate.split('T')[0];
+    } else if (shiftData.shiftDate.includes('/')) {
       const [day, month, year] = shiftData.shiftDate.split('/');
       normalizedShiftDate = `${year}-${month.padStart(2, '0')}-${day.padStart(2, '0')}`;
     }
     
     if (normalizedShiftDate < today) {
-      console.log(`📅 PAST DATE DETECTED: ${normalizedShiftDate} < ${today} - Checking if shift should be COMPLETED`);
+      console.log(`📅 PAST DATE DETECTED: ${normalizedShiftDate} < ${today} - Checking for overnight shift scenario`);
       
-      // For past dates, if there are completed segments, mark as COMPLETED
+      // 🌙 OVERNIGHT SHIFT CHECK: If date is exactly 1 day ago, might still be active
+      const shiftDateObj = new Date(normalizedShiftDate + 'T00:00:00');
+      const todayObj = new Date(today + 'T00:00:00');
+      const dayDifference = Math.floor((todayObj - shiftDateObj) / (1000 * 60 * 60 * 24));
+      
+      if (dayDifference === 1 && segments.length > 0) {
+        // Check if shift ends in early morning (overnight shift indicator)
+        const lastSegment = segments[segments.length - 1];
+        const lastEndTime = lastSegment?.endTime;
+        
+        if (lastEndTime) {
+          const [endHour] = lastEndTime.split(':').map(Number);
+          
+          // If shift ends between midnight and 8 AM, it's likely an overnight shift
+          if (endHour >= 0 && endHour <= 8) {
+            const [currentHour] = currentTime.split(':').map(Number);
+            
+            // If current time is before shift end time in early morning
+            if (currentHour >= 0 && currentHour <= 8 && currentHour < endHour) {
+              console.log(`🌙 OVERNIGHT SHIFT STILL ACTIVE: Shift date ${normalizedShiftDate}, ends at ${lastEndTime}, current ${currentTime}`);
+              // Don't mark as COMPLETED - let normal time-based logic handle it
+              return {
+                status: shiftData.status, // Keep current status
+                _statusCorrected: false,
+                _correctionReason: null,
+                _originalBackendStatus: originalStatus
+              };
+            }
+          }
+        }
+      }
+      
+      // Normal past date logic
       const completedSegments = segments.filter(seg => seg.endTime);
       if (completedSegments.length > 0) {
         console.log(`🏁 PAST DATE WITH COMPLETED SEGMENTS → COMPLETED`);

@@ -1,126 +1,31 @@
 import React, { useState, useEffect, useCallback } from 'react';
-import { TextField } from '@mui/material';
-import { DatePicker } from '@mui/x-date-pickers/DatePicker';
-import { LocalizationProvider } from '@mui/x-date-pickers/LocalizationProvider';
-import { AdapterDateFns } from '@mui/x-date-pickers/AdapterDateFns';
-import { 
-  Button, 
-  Grid, 
-  Alert,
-  Box,
-  CircularProgress,
-  Card,
-  CardContent,
-  Typography,
-  Chip,
-  Paper,
-  List,
-  ListItem,
-  ListItemIcon,
-  ListItemText
-} from '@mui/material';
-import { 
-  AccessTime,
-  PlayArrow,
-  Pause,
-  Stop,
-  Schedule,
-  CheckCircle
-} from '@mui/icons-material';
 import { useAuth } from '../../contexts/AuthContext';
 import { 
-  getCurrentShift, 
-  getCurrentDate,
   handleAPIError,
   makeAPICall,
   syncStatusToSheet,
   submitTimeSegments,
   applyFrontendSmartStatus,
   fixShiftStatus,
-  getCurrentShiftWithCrossMidnight
+  getShifts,
+  updateShiftWithEditTracking,
+  getDayNameFromDate
 } from '../../services/appScriptAPI';
 import TimeSegmentEntry from '../TimeSegmentEntry/TimeSegmentEntry';
 
 const ShiftEntry = ({ refreshTrigger }) => {
   const { user } = useAuth();
-  const [currentShift, setCurrentShift] = useState(null);
+  const [shifts, setShifts] = useState([]);
   const [message, setMessage] = useState('');
   const [loading, setLoading] = useState(false);
-  const [selectedDate, setSelectedDate] = useState(new Date());
-
-  // When the date changes, clear current shift and fetch new data
-  useEffect(() => {
-    if (user && selectedDate) {
-      setCurrentShift(null);
-      setMessage('Loading shift data for selected date...');
-      // Always enforce DRAFT for future dates, skip correction logic
-      (async () => {
-        let response = await getCurrentShiftWithCrossMidnight({
-          employeeId: user.id,
-          date: selectedDate.toISOString().split('T')[0],
-          forceRefresh: true
-        });
-        if (response.success && response.data) {
-          const today = new Date();
-          today.setHours(0, 0, 0, 0);
-          let shiftDate = new Date(selectedDate);
-          shiftDate.setHours(0, 0, 0, 0);
-          // If future date, always display DRAFT and skip correction
-          if (shiftDate > today) {
-            response.data.status = 'DRAFT';
-            setCurrentShift(response.data);
-            setMessage(`📊 Current status: DRAFT (future date)`);
-            return;
-          }
-          // For today/past, use enhanced smart status and correct if needed
-          const correction = detectStatusCorrection(response.data);
-          if (correction.needsCorrection) {
-            console.log(`🔄 ShiftEntry STATUS CORRECTION: ${correction.originalStatus} → ${correction.correctedStatus}`);
-            try {
-              // Use the robust fixShiftStatus system
-              const fixResult = await fixShiftStatus({
-                shiftId: response.data.shiftId,
-                correctStatus: correction.correctedStatus
-              });
-              
-              if (fixResult.success) {
-                console.log('✅ ShiftEntry status correction applied successfully');
-                await new Promise(resolve => setTimeout(resolve, 1000));
-              } else {
-                console.warn('⚠️ fixShiftStatus failed, falling back to syncStatusToSheet');
-                // Fallback to original method
-                await syncStatusToSheet(
-                  response.data.shiftId,
-                  correction.correctedStatus,
-                  `Smart status update: ${correction.originalStatus} → ${correction.correctedStatus}`
-                );
-                await new Promise(resolve => setTimeout(resolve, 1000));
-              }
-            } catch (error) {
-              console.error('❌ Status correction error:', error);
-              setMessage(`❌ Error updating status: ${error.message}`);
-            }
-            
-            response = await getCurrentShiftWithCrossMidnight({
-              employeeId: user.id,
-              date: selectedDate.toISOString().split('T')[0],
-              forceRefresh: true
-            });
-          }
-          setCurrentShift(response.data);
-          setMessage(`📊 Current status: ${response.data.status} (verified)`);
-        } else {
-          setCurrentShift(null);
-          let dateStr = 'today';
-          if (selectedDate instanceof Date && !isNaN(selectedDate)) {
-            dateStr = selectedDate.toLocaleDateString('en-US');
-          }
-          setMessage(`No shift found for ${dateStr}.`);
-        }
-      })();
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [selectedDate]);
+  const [editingShift, setEditingShift] = useState(null);
+  const [editFormData, setEditFormData] = useState({
+    firstStartTime: '',
+    lastEndTime: '',
+    shiftType: 'Regular'
+  });
+  const [saving, setSaving] = useState(false);
+  const [showAdvancedEdit, setShowAdvancedEdit] = useState(false);
 
   // Enhanced Smart Status Calculation (synchronized with AdminDashboard)
   // Enhanced status determination using the same robust logic as ShiftHistory
@@ -146,6 +51,7 @@ const ShiftEntry = ({ refreshTrigger }) => {
   };
 
   // LEGACY FALLBACK: Keep original logic as backup (not used but preserved)
+  // eslint-disable-next-line no-unused-vars
   const determineSmartStatusLegacy = (shiftData) => {
     // Refined status logic:
     // - Future date: DRAFT
@@ -249,89 +155,108 @@ const ShiftEntry = ({ refreshTrigger }) => {
     return 'DRAFT';
   };
 
-  // Load current shift with smart calculation → update sheet → fetch fresh data
+  // Generate date rows for current day + next 2 months
+  const generateDateRows = useCallback(() => {
+    const rows = [];
+    const today = new Date();
+    const endDate = new Date();
+    endDate.setMonth(endDate.getMonth() + 2); // Next 2 months
+    
+    for (let d = new Date(today); d <= endDate; d.setDate(d.getDate() + 1)) {
+      const dateStr = d.toISOString().split('T')[0];
+      rows.push({
+        date: dateStr,
+        dayName: d.toLocaleDateString('en-US', { weekday: 'short' }),
+        displayDate: d.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' })
+      });
+    }
+    return rows;
+  }, []);
+
+  // Load shifts with smart calculation → update sheet → fetch fresh data (EXACT SAME LOGIC)
   const loadCurrentShiftStatus = useCallback(async () => {
     if (!user) return;
     setLoading(true);
     setMessage('Loading shift data from Google Sheets...');
     
     try {
-      // Capture the date at the start of the function to avoid race conditions
-      const dateAtFetch = selectedDate instanceof Date && !isNaN(selectedDate)
-        ? new Date(selectedDate)
-        : new Date();
-      // Always fetch, recalculate, update sheet if needed, then fetch again
-      let response = await getCurrentShiftWithCrossMidnight({
+      // Fetch all shifts for the user
+      let response = await getShifts({
         employeeId: user.id,
-        date: dateAtFetch.toISOString().split('T')[0],
         forceRefresh: true
       });
 
       if (response.success && response.data) {
-        console.log('📊 RECEIVED SHEET DATA:', JSON.stringify(response.data, null, 2));
+        const shiftsData = Array.isArray(response.data) ? response.data : [response.data];
+        console.log(`📊 RECEIVED ${shiftsData.length} SHIFTS FROM SHEET`);
 
-        const sheetStatus = response.data.status;
-        const calculatedStatus = determineSmartStatus(response.data);
+        // Apply EXACT SAME status correction logic to each shift
+        let fixedCount = 0;
+        for (const shift of shiftsData) {
+          const sheetStatus = shift.status;
+          const calculatedStatus = determineSmartStatus(shift);
+          console.log(`STATUS CHECK: Shift ${shift.shiftId} - Sheet="${sheetStatus}" vs Calculated="${calculatedStatus}"`);
 
-        console.log(`STATUS COMPARISON: Sheet="${sheetStatus}" vs Calculated="${calculatedStatus}"`);
-
-        // Use enhanced status correction detection
-        const correction = detectStatusCorrection(response.data);
-        if (correction.needsCorrection) {
-          console.log(`🔄 UPDATING SHEET: ${correction.originalStatus} → ${correction.correctedStatus}`);
-          try {
-            // Try the robust fixShiftStatus first
-            const fixResult = await fixShiftStatus({
-              shiftId: response.data.shiftId,
-              correctStatus: correction.correctedStatus
-            });
-            
-            if (fixResult.success) {
-              console.log('✅ Sheet updated successfully with fixShiftStatus');
-            } else {
-              console.warn('⚠️ fixShiftStatus failed, using fallback');
-              // Fallback to original method
-              const syncResult = await syncStatusToSheet(
-                response.data.shiftId,
-                correction.correctedStatus,
-                `Smart status update: ${correction.originalStatus} → ${correction.correctedStatus}`
-              );
-              if (syncResult.success) {
-                console.log('✅ Sheet updated successfully with fallback');
+          // Use enhanced status correction detection (EXACT SAME LOGIC)
+          const correction = detectStatusCorrection(shift);
+          if (correction.needsCorrection) {
+            console.log(`🔄 UPDATING SHEET: ${shift.shiftId} ${correction.originalStatus} → ${correction.correctedStatus}`);
+            try {
+              // Try the robust fixShiftStatus first (EXACT SAME LOGIC)
+              const fixResult = await fixShiftStatus({
+                shiftId: shift.shiftId,
+                correctStatus: correction.correctedStatus
+              });
+              
+              if (fixResult.success) {
+                console.log(`✅ Sheet updated successfully for shift ${shift.shiftId}`);
+                fixedCount++;
               } else {
-                setMessage(`⚠️ Failed to update sheet: ${syncResult.message}`);
+                console.warn('⚠️ fixShiftStatus failed, using fallback');
+                // Fallback to original method (EXACT SAME LOGIC)
+                const syncResult = await syncStatusToSheet(
+                  shift.shiftId,
+                  correction.correctedStatus,
+                  `Smart status update: ${correction.originalStatus} → ${correction.correctedStatus}`
+                );
+                if (syncResult.success) {
+                  console.log('✅ Sheet updated successfully with fallback');
+                  fixedCount++;
+                }
               }
+            } catch (error) {
+              console.error('❌ Status update error:', error);
             }
-          } catch (error) {
-            console.error('❌ Status update error:', error);
-            setMessage(`❌ Error updating status: ${error.message}`);
           }
-          // Always fetch fresh data after update attempt
-          response = await getCurrentShiftWithCrossMidnight({
+        }
+
+        // Re-fetch if any corrections were made (EXACT SAME LOGIC)
+        if (fixedCount > 0) {
+          console.log(`🔄 Re-fetching after ${fixedCount} corrections...`);
+          response = await getShifts({
             employeeId: user.id,
-            date: dateAtFetch.toISOString().split('T')[0],
             forceRefresh: true
           });
+          if (response.success && response.data) {
+            const freshShiftsData = Array.isArray(response.data) ? response.data : [response.data];
+            setShifts(freshShiftsData);
+            setMessage(`✅ Loaded ${freshShiftsData.length} shifts (${fixedCount} status corrections applied)`);
+          }
+        } else {
+          setShifts(shiftsData);
+          setMessage(`✅ Loaded ${shiftsData.length} shifts`);
         }
-        // Display latest data
-        setCurrentShift(response.data);
-        setMessage(`📊 Current status: ${response.data.status} (verified)`);
       } else {
-        setCurrentShift(null);
-        // Always use the selectedDate for the message
-        let dateStr = 'today';
-        if (selectedDate instanceof Date && !isNaN(selectedDate)) {
-          // Format as MM/DD/YYYY for clarity
-          dateStr = selectedDate.toLocaleDateString('en-US');
-        }
-        setMessage(`No shift found for ${dateStr}.`);
+        setShifts([]);
+        setMessage('Ready to add shift times');
       }
     } catch (error) {
       setMessage('Error: ' + handleAPIError(error));
+      setShifts([]);
     } finally {
       setLoading(false);
     }
-  }, [user, selectedDate]);
+  }, [user]);
 
   useEffect(() => {
     if (user) {
@@ -420,31 +345,198 @@ const ShiftEntry = ({ refreshTrigger }) => {
     };
   }, [user, loadCurrentShiftStatus]);
 
+  // Handle edit shift (open modal)
+  const handleEditShift = (shift) => {
+    console.log('📝 Edit shift clicked:', shift);
+    setEditingShift(shift);
+    
+    const extractTime = (timeValue) => {
+      if (!timeValue) return '';
+      if (typeof timeValue === 'string' && /^\d{2}:\d{2}$/.test(timeValue)) {
+        return timeValue;
+      }
+      if (timeValue instanceof Date || (typeof timeValue === 'string' && timeValue.includes('1899-12-30'))) {
+        const date = new Date(timeValue);
+        const hours = date.getUTCHours().toString().padStart(2, '0');
+        const minutes = date.getUTCMinutes().toString().padStart(2, '0');
+        return `${hours}:${minutes}`;
+      }
+      if (typeof timeValue === 'string' && timeValue.includes('T')) {
+        const date = new Date(timeValue);
+        return date.toLocaleTimeString('en-US', { 
+          hour12: false, 
+          hour: '2-digit', 
+          minute: '2-digit',
+          timeZone: 'Asia/Calcutta'
+        });
+      }
+      return '';
+    };
+    
+    let startTime = '';
+    let endTime = '';
+    
+    if (shift.segments && shift.segments.length > 0) {
+      const firstSegment = shift.segments[0];
+      const lastSegment = shift.segments[shift.segments.length - 1];
+      startTime = firstSegment.startTime || extractTime(shift.firstStartTime || shift.startTime);
+      endTime = lastSegment.endTime || extractTime(shift.lastEndTime || shift.endTime);
+    } else {
+      startTime = extractTime(shift.firstStartTime || shift.startTime);
+      endTime = extractTime(shift.lastEndTime || shift.endTime);
+    }
+    
+    setEditFormData({
+      firstStartTime: startTime,
+      lastEndTime: endTime,
+      shiftType: shift.shiftType || 'Regular'
+    });
+  };
+
+  const handleCancelEdit = () => {
+    setEditingShift(null);
+    setEditFormData({
+      firstStartTime: '',
+      lastEndTime: '',
+      shiftType: 'Regular'
+    });
+    setShowAdvancedEdit(false);
+  };
+
+  const calculateDuration = (startTime, endTime) => {
+    if (!startTime || !endTime) return 0;
+    try {
+      const start = new Date(`1970-01-01T${startTime}:00`);
+      const end = new Date(`1970-01-01T${endTime}:00`);
+      let diffMs = end - start;
+      if (diffMs < 0) diffMs += 24 * 60 * 60 * 1000;
+      const hours = diffMs / (1000 * 60 * 60);
+      return Math.round(hours * 100) / 100;
+    } catch (error) {
+      console.error('Error calculating duration:', error);
+      return 0;
+    }
+  };
+
+  const handleSaveEdit = async () => {
+    if (!editingShift || !editFormData.firstStartTime || !editFormData.lastEndTime) {
+      alert('Please fill in both start and end times.');
+      return;
+    }
+
+    const newDuration = calculateDuration(editFormData.firstStartTime, editFormData.lastEndTime);
+    if (newDuration <= 0 || newDuration >= 24) {
+      alert('Invalid time range. Shift must be within 24 hours.');
+      return;
+    }
+
+    const timeRegex = /^([0-1]?[0-9]|2[0-3]):[0-5][0-9]$/;
+    if (!timeRegex.test(editFormData.firstStartTime) || !timeRegex.test(editFormData.lastEndTime)) {
+      alert('Please enter valid time format (HH:MM).');
+      return;
+    }
+
+    setSaving(true);
+    try {
+      // Create updated segments data (EXACT SAME LOGIC)
+      const updatedSegments = [{
+        segmentId: 1,
+        startTime: editFormData.firstStartTime,
+        endTime: editFormData.lastEndTime,
+        duration: newDuration
+      }];
+
+      // Calculate smart status (EXACT SAME LOGIC)
+      const mockShiftData = {
+        segments: updatedSegments,
+        status: 'ACTIVE'
+      };
+      const calculatedStatus = determineSmartStatus(mockShiftData);
+      
+      console.log(`📊 ShiftEntry ${editingShift.isNew ? 'Add' : 'Edit'} - Smart status calculated: ${calculatedStatus}`);
+
+      let response;
+      
+      if (editingShift.isNew) {
+        // For NEW shifts, use submitTimeSegments (EXACT SAME LOGIC as ShiftEntry original)
+        response = await submitTimeSegments({
+          segments: updatedSegments,
+          employeeName: user.name,
+          employeeId: user.id,
+          date: editingShift.shiftDate || editingShift.date,
+          shiftType: editFormData.shiftType
+        });
+      } else {
+        // For EXISTING shifts, use updateShiftWithEditTracking
+        response = await updateShiftWithEditTracking({
+          shiftId: editingShift.shiftId || editingShift.id,
+          employeeName: user.name,
+          employeeId: user.id,
+          shiftDate: editingShift.shiftDate || editingShift.date,
+          shiftType: editFormData.shiftType,
+          segments: updatedSegments,
+          firstStartTime: editFormData.firstStartTime,
+          lastEndTime: editFormData.lastEndTime,
+          totalDuration: newDuration,
+          scheduleStatus: calculatedStatus,
+          isUpdate: true,
+          isEmployeeEdit: true,
+          editedBy: user.name,
+          editedById: user.id
+        });
+      }
+
+      if (response.success) {
+        alert(editingShift.isNew ? '✅ Shift added successfully!' : '✅ Shift updated successfully!');
+        handleCancelEdit();
+        setTimeout(() => {
+          loadCurrentShiftStatus();
+        }, 1000);
+      } else {
+        alert(`Error ${editingShift.isNew ? 'adding' : 'updating'} shift: ` + response.message);
+      }
+    } catch (error) {
+      console.error(`Failed to ${editingShift.isNew ? 'add' : 'update'} shift:`, error);
+      alert(`Error ${editingShift.isNew ? 'adding' : 'updating'} shift: ` + handleAPIError(error));
+    } finally {
+      setSaving(false);
+    }
+  };
+
   const handleSubmitTimeSegments = async (segments, scheduleInfo = {}) => {
-    setLoading(true);
+    if (!editingShift) return;
+    
+    setSaving(true);
     setMessage('');
     
     if (!user || !user.name || !user.id) {
       setMessage('Error: User information not available.');
-      setLoading(false);
+      setSaving(false);
       return;
     }
 
     try {
       const payload = {
         segments,
-        employeeName: user.name,
-        employeeId: user.id,
-        shiftType: 'Regular',
-        date: selectedDate ? selectedDate.toISOString().split('T')[0] : getCurrentDate(),
+        // Use user data as primary source, fallback to shift data
+        employeeName: user.name || editingShift.employeeName || editingShift.name,
+        employeeId: user.id || editingShift.employeeId || editingShift.id,
+        date: editingShift.shiftDate || editingShift.date,
+        shiftType: editingShift.shiftType || 'Regular',
         ...scheduleInfo
       };
       
-      // 🔥 CRITICAL: Pass existing shift ID if available for proper segment updates
-      if (currentShift && currentShift.shiftId) {
-        payload.existingShiftId = currentShift.shiftId;
+      console.log('🔍 Segment submission - User data:', { userName: user.name, userId: user.id });
+      console.log('🔍 Segment submission - Shift data:', { 
+        shiftName: editingShift.employeeName, 
+        shiftId: editingShift.employeeId 
+      });
+      
+      // 🔥 CRITICAL: Pass existing shift ID if available for proper segment updates (EXACT SAME LOGIC)
+      if (editingShift && (editingShift.shiftId || editingShift.id) && !editingShift.isNew) {
+        payload.existingShiftId = editingShift.shiftId || editingShift.id;
         payload.isUpdate = true;
-        console.log(`🔧 Using existing shift ID: ${currentShift.shiftId} for segment update`);
+        console.log(`🔧 Using existing shift ID: ${editingShift.shiftId || editingShift.id} for segment update`);
       } else {
         console.log('🆕 Creating new shift (no existing shift ID)');
       }
@@ -455,26 +547,30 @@ const ShiftEntry = ({ refreshTrigger }) => {
 
       if (response.success) {
         setMessage('✅ Time segments updated successfully in Google Sheets!');
+        alert('✅ Time segments updated successfully!');
+        handleCancelEdit();
         
-        // 🔄 Force fresh data reload to show updated segments
+        // 🔄 Force fresh data reload to show updated segments (EXACT SAME LOGIC)
         console.log('🔄 Forcing fresh data reload after segment update...');
         setTimeout(() => {
           loadCurrentShiftStatus();
-        }, 1000); // Small delay to ensure backend processing is complete
-        
+        }, 1000);
       } else {
         setMessage('❌ Error: ' + response.message);
+        alert('Error updating time segments: ' + response.message);
       }
     } catch (error) {
       setMessage('❌ Error: ' + handleAPIError(error));
+      console.error('Failed to update time segments:', error);
+      alert('Error updating time segments: ' + handleAPIError(error));
     } finally {
-      setLoading(false);
+      setSaving(false);
     }
   };
 
-  const handleCompleteShift = async () => {
-    if (!currentShift || !currentShift.shiftId) {
-      setMessage('Error: No active shift to complete.');
+  const handleCompleteShift = async (shift) => {
+    if (!shift || !shift.shiftId) {
+      setMessage('Error: No shift to finalize.');
       return;
     }
 
@@ -482,200 +578,549 @@ const ShiftEntry = ({ refreshTrigger }) => {
     try {
       const response = await makeAPICall({
         action: 'completeShift',
-        shiftId: currentShift.shiftId,
+        shiftId: shift.shiftId,
         employeeId: user.id,
         completedAt: new Date().toISOString(),
-        date: selectedDate ? selectedDate.toISOString().split('T')[0] : getCurrentDate()
+        date: shift.shiftDate || shift.date
       });
 
       if (response.success) {
-        setMessage('Shift completed successfully!');
+        alert('✅ Shift finalized successfully!');
         loadCurrentShiftStatus();
       } else {
-        setMessage('Error: ' + response.message);
+        alert('Error: ' + response.message);
       }
     } catch (error) {
-      setMessage('Error: ' + handleAPIError(error));
+      alert('Error: ' + handleAPIError(error));
     } finally {
       setLoading(false);
     }
   };
 
-  const renderStatusChip = (status) => {
-    const statusConfig = {
-      'DRAFT': { color: 'default', icon: <Schedule />, label: 'Draft' },
-      'OFFLINE': { color: 'default', icon: <Pause />, label: 'Offline' },
-      'ACTIVE': { color: 'success', icon: <PlayArrow />, label: 'Active' },
-      'ON BREAK': { color: 'warning', icon: <Pause />, label: 'On Break' },
-      'COMPLETED': { color: 'primary', icon: <CheckCircle />, label: 'Completed' }
-    };
-
-    const config = statusConfig[status] || statusConfig['DRAFT'];
-    
-    return (
-      <Chip
-        icon={config.icon}
-        label={config.label}
-        color={config.color}
-        variant="outlined"
-        size="small"
-      />
-    );
+  const formatDate = (dateStr) => {
+    try {
+      const date = new Date(dateStr);
+      return date.toLocaleDateString(undefined, {
+        timeZone: Intl.DateTimeFormat().resolvedOptions().timeZone,
+        year: 'numeric',
+        month: '2-digit',
+        day: '2-digit'
+      });
+    } catch {
+      return dateStr;
+    }
   };
 
-  const renderShiftSummary = () => {
-    if (!currentShift) return null;
-
-    const { segments = [], status } = currentShift;
-    // Always use the frontend-calculated status for display
-    const displayStatus = determineSmartStatus(currentShift);
-
-    return (
-      <Card sx={{ mb: 2 }}>
-        <CardContent>
-          <Box display="flex" justifyContent="space-between" alignItems="center" mb={2}>
-            <Typography variant="h6">Current Shift (Pure Sheet Data)</Typography>
-            <Box display="flex" alignItems="center" gap={1}>
-              {renderStatusChip(displayStatus)}
-            </Box>
-          </Box>
-          
-          <Box mb={2}>
-            <Typography variant="body2" color="text.secondary">
-              Shift ID: {currentShift.shiftId} | Date: {currentShift.date}
-              {currentShift.day && (
-                <Chip 
-                  label={currentShift.day} 
-                  size="small" 
-                  color="secondary" 
-                  sx={{ ml: 1 }} 
-                />
-              )}
-              {currentShift._isCrossMidnight && (
-                <Chip 
-                  label="Cross-Midnight Shift" 
-                  size="small" 
-                  color="info" 
-                  sx={{ ml: 1 }} 
-                />
-              )}
-            </Typography>
-            <Typography variant="body2" color="text.secondary">
-              Total Duration: {currentShift.totalDuration || 'N/A'} | Last End: {currentShift.lastEndTime || 'N/A'}
-            </Typography>
-            {currentShift._crossMidnightNote && (
-              <Typography variant="body2" color="info.main" sx={{ fontStyle: 'italic', mt: 1 }}>
-                ℹ️ {currentShift._crossMidnightNote}
-              </Typography>
-            )}
-          </Box>
-          
-          {segments.length > 0 && (
-            <Box>
-              <Typography variant="subtitle2" gutterBottom>
-                Time Segments:
-              </Typography>
-              <List dense>
-                {segments.map((segment, index) => (
-                  <ListItem key={index}>
-                    <ListItemIcon>
-                      <AccessTime fontSize="small" />
-                    </ListItemIcon>
-                    <ListItemText
-                      primary={`${segment.startTime} - ${segment.endTime || 'In Progress'}`}
-                      secondary={segment.activity || 'Work'}
-                    />
-                  </ListItem>
-                ))}
-              </List>
-            </Box>
-          )}
-        </CardContent>
-      </Card>
-    );
+  const formatTime = (timeStr) => {
+    if (!timeStr || timeStr === '-') return '-';
+    try {
+      if (timeStr.match(/^\d{1,2}:\d{2}$/)) {
+        return timeStr;
+      }
+      if (timeStr.includes('T')) {
+        const date = new Date(timeStr);
+        return date.toLocaleTimeString('en-US', { 
+          hour: '2-digit', 
+          minute: '2-digit', 
+          hour12: false
+        });
+      }
+      return timeStr;
+    } catch (error) {
+      return timeStr;
+    }
   };
+
+  const formatDuration = (duration) => {
+    const num = parseFloat(duration);
+    return isNaN(num) ? '0.00' : num.toFixed(2);
+  };
+
+  if (!user) {
+    return (
+      <div className="alert alert-warning">
+        Please log in to manage your shifts.
+      </div>
+    );
+  }
+
+  // Generate all date rows
+  const dateRows = generateDateRows();
+  
+  // Create a map of existing shifts by date for quick lookup
+  const shiftsByDate = {};
+  shifts.forEach(shift => {
+    const dateKey = (shift.shiftDate || shift.date);
+    shiftsByDate[dateKey] = shift;
+  });
 
   return (
-    <Box>
-      <Typography variant="h4" gutterBottom>
-        Shift Entry
-      </Typography>
+    <div className="container-fluid p-3" style={{ 
+      minHeight: '100vh' 
+    }}>
+      <style>{`
+        .card-hover {
+          transition: transform 0.3s ease, box-shadow 0.3s ease;
+        }
+        .card-hover:hover {
+          transform: translateY(-5px);
+          box-shadow: 0 10px 30px rgba(0,0,0,0.2) !important;
+        }
+        .btn-shine {
+          position: relative;
+          overflow: hidden;
+        }
+        .btn-shine::before {
+          content: '';
+          position: absolute;
+          top: 0;
+          left: -100%;
+          width: 100%;
+          height: 100%;
+          background: linear-gradient(90deg, transparent, rgba(255,255,255,0.3), transparent);
+          transition: left 0.5s;
+        }
+        .btn-shine:hover::before {
+          left: 100%;
+        }
+        .pulse-badge {
+          animation: pulse 2s infinite;
+        }
+        @keyframes pulse {
+          0%, 100% { opacity: 1; }
+          50% { opacity: 0.7; }
+        }
+      `}</style>
+      <div className="row g-0">
+        <div className="col-12">
+          <div className="card border-0 mb-4 shadow-lg" style={{ 
+            background: '#0f3460',
+            borderRadius: '12px'
+          }}>
+            <div className="card-body py-3" style={{
+              background: 'linear-gradient(135deg, #e94560 0%, #ff6b6b 100%)',
+              borderRadius: '12px'
+            }}>
+              <div className="d-flex flex-column flex-sm-row justify-content-between align-items-start align-items-sm-center gap-2">
+                <div>
+                  <h4 className="mb-1" style={{ color: '#2d3748', fontWeight: '700' }}>
+                    <i className="bi bi-calendar-check me-2"></i>
+                    Fill My Shifts
+                  </h4>
+                  <small style={{ color: '#4a5568' }}>
+                    <i className="bi bi-info-circle me-1"></i>
+                    Today + Future Dates - Add times and submit each shift
+                  </small>
+                </div>
+                <button 
+                  className="btn btn-shine"
+                  onClick={() => loadCurrentShiftStatus()}
+                  disabled={loading}
+                  style={{
+                    fontWeight: '600',
+                    borderRadius: '10px',
+                    padding: '10px 20px',
+                    boxShadow: '0 4px 15px rgba(0,0,0,0.2)'
+                  }}
+                >
+                  {loading ? (
+                    <>
+                      <span className="spinner-border spinner-border-sm me-2" role="status"></span>
+                      Loading...
+                    </>
+                  ) : (
+                    <>
+                      <i className="bi bi-arrow-clockwise me-2" style={{ animation: 'spin 2s linear infinite' }}></i>
+                      <style>{`@keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); }}`}</style>
+                      Refresh Data
+                    </>
+                  )}
+                </button>
+              </div>
+            </div>
+          </div>
 
-      <LocalizationProvider dateAdapter={AdapterDateFns}>
-        <DatePicker
-          label="Select Shift Date"
-          value={selectedDate}
-          onChange={(newDate) => setSelectedDate(newDate)}
-          disablePast={false}
-          renderInput={(params) => <TextField {...params} sx={{ mb: 2 }} />}
-        />
-      </LocalizationProvider>
+          {message && (
+            <div className={`alert ${message.includes('✅') ? 'alert-success' : message.includes('❌') ? 'alert-danger' : 'alert-info'} alert-dismissible fade show`} role="alert">
+              {message}
+              <button 
+                type="button" 
+                className="btn-close" 
+                onClick={() => setMessage('')}
+                aria-label="Close"
+              ></button>
+            </div>
+          )}
 
-      {message && (
-        <Alert 
-          severity={message.includes('Error') ? 'error' : 'success'} 
-          sx={{ mb: 2 }}
-        >
-          {message}
-        </Alert>
+          {loading ? (
+            <div className="d-flex justify-content-center">
+              <div className="spinner-border" role="status">
+                <span className="visually-hidden">Loading...</span>
+              </div>
+            </div>
+          ) : (
+            <>
+              {/* Mobile Card View */}
+              <div className="d-block d-md-none">
+                {dateRows.map((dateRow, index) => {
+                  const existingShift = shiftsByDate[dateRow.date];
+                  const isCompleted = existingShift && existingShift.status === 'COMPLETED';
+                  
+                  return (
+                    <div key={index} className={`card mb-3 card-hover`} style={{ 
+                      borderLeft: `4px solid ${isCompleted ? '#00d9ff' : existingShift ? '#e94560' : '#5a5a5a'}`,
+                      backgroundColor: '#0f3460',
+                      borderRadius: '8px',
+                      boxShadow: '0 4px 12px rgba(0,0,0,0.4)',
+                      color: 'white'
+                    }}>
+                      <div className="card-header py-2 border-0" style={{
+                        background: isCompleted ? '#00d9ff' : 
+                                    existingShift ? '#e94560' : 
+                                    '#16213e',
+                        borderRadius: '8px 8px 0 0',
+                        color: 'white'
+                      }}>
+                        <div className="d-flex justify-content-between align-items-center">
+                          <div>
+                            <strong className="text-white">{dateRow.displayDate}</strong>
+                            <span className="badge bg-white bg-opacity-25 text-white ms-2">{dateRow.dayName}</span>
+                          </div>
+                          {existingShift && (
+                            <span className={`badge pulse-badge ${
+                              existingShift.status === 'COMPLETED' ? 'bg-light text-success' : 
+                              existingShift.status === 'ACTIVE' ? 'bg-light text-primary' : 
+                              existingShift.status === 'DRAFT' ? 'bg-warning text-dark' : 'bg-light text-secondary'
+                            }`} style={{ fontWeight: '700', padding: '6px 12px' }}>
+                              {existingShift.status}
+                            </span>
+                          )}
+                        </div>
+                      </div>
+                      <div className="card-body p-2" style={{ backgroundColor: '#0f3460', color: 'white' }}>
+                        {existingShift ? (
+                          <div className="row g-2 small">
+                            <div className="col-6">
+                              <div className="small" style={{ color: '#9ca3af' }}>Start Time</div>
+                              <strong style={{ color: 'white' }}>{formatTime(existingShift.firstStartTime || existingShift.startTime)}</strong>
+                            </div>
+                            <div className="col-6">
+                              <div className="small" style={{ color: '#9ca3af' }}>End Time</div>
+                              <strong style={{ color: 'white' }}>{formatTime(existingShift.lastEndTime || existingShift.endTime)}</strong>
+                            </div>
+                            <div className="col-12">
+                              <div className="small" style={{ color: '#9ca3af' }}>Duration</div>
+                              <strong style={{ color: '#00d9ff' }}>{formatDuration(existingShift.totalDuration)} hrs</strong>
+                            </div>
+                            <div className="col-12 mt-2">
+                              <button 
+                                className={`btn btn-sm w-100 btn-shine ${
+                                  isCompleted ? 'btn-outline-success' : 'btn-primary'
+                                }`}
+                                onClick={() => handleEditShift(existingShift)}
+                                disabled={saving}
+                                style={{
+                                  borderRadius: '10px',
+                                  fontWeight: '600',
+                                  padding: '8px'
+                                }}
+                              >
+                                <i className={`bi ${isCompleted ? 'bi-eye' : 'bi-pencil'} me-1`}></i>
+                                {isCompleted ? 'View Details' : 'Edit Shift'}
+                              </button>
+                            </div>
+                          </div>
+                        ) : (
+                          <button 
+                            className="btn w-100 btn-shine"
+                            style={{
+                              borderRadius: '6px',
+                              fontWeight: '600',
+                              padding: '10px',
+                              background: 'linear-gradient(135deg, #00d9ff 0%, #0088cc 100%)',
+                              border: 'none',
+                              color: 'white'
+                            }}
+                            onClick={() => {
+                              setEditingShift({ date: dateRow.date, shiftDate: dateRow.date, isNew: true });
+                              setEditFormData({ firstStartTime: '', lastEndTime: '', shiftType: 'Regular' });
+                            }}
+                            disabled={saving}
+                          >
+                            <i className="bi bi-plus-circle me-2"></i>
+                            Add Shift
+                          </button>
+                        )}
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+
+              {/* Desktop Table View */}
+              <div className="table-responsive d-none d-md-block shadow-lg" style={{ 
+                backgroundColor: '#0f3460',
+                borderRadius: '8px',
+                overflow: 'hidden'
+              }}>
+                <table className="table table-hover mb-0" style={{ color: 'white' }}>
+                  <thead style={{ 
+                    background: 'linear-gradient(135deg, #e94560 0%, #ff6b6b 100%)', 
+                    color: 'white'
+                  }}>
+                    <tr>
+                      <th style={{width: '150px'}}>Date</th>
+                      <th style={{width: '80px'}}>Day</th>
+                      <th style={{width: '120px'}}>Start Time</th>
+                      <th style={{width: '120px'}}>End Time</th>
+                      <th style={{width: '100px'}}>Duration</th>
+                      <th style={{width: '100px'}}>Status</th>
+                      <th style={{width: '140px'}}>Action</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {dateRows.map((dateRow, index) => {
+                      const existingShift = shiftsByDate[dateRow.date];
+                      const isCompleted = existingShift && existingShift.status === 'COMPLETED';
+                      const isActive = existingShift && existingShift.status === 'ACTIVE';
+                      
+                      return (
+                        <tr key={index} style={{
+                          backgroundColor: isCompleted ? 'rgba(0, 217, 255, 0.15)' : 
+                                           isActive ? 'rgba(233, 69, 96, 0.15)' : 
+                                           existingShift ? 'rgba(255, 255, 255, 0.05)' : 'transparent',
+                          transition: 'all 0.2s ease',
+                          color: 'white'
+                        }} className="table-row-hover">
+                        <style>{`.table-row-hover:hover { background-color: rgba(233, 69, 96, 0.25) !important; }`}</style>
+                          <td><strong className={
+                            isCompleted ? 'text-success' : isActive ? 'text-primary' : ''
+                          }>{dateRow.displayDate}</strong></td>
+                          <td>
+                            <span className="badge pulse-badge" style={{ 
+                              padding: '6px 12px', 
+                              fontWeight: '700',
+                              backgroundColor: isCompleted ? '#00d9ff' : existingShift ? '#e94560' : '#5a5a5a',
+                              color: 'white'
+                            }}>{dateRow.dayName}</span>
+                          </td>
+                          <td className={existingShift ? 'fw-semibold' : 'text-muted'}>
+                            {existingShift ? formatTime(existingShift.firstStartTime || existingShift.startTime) : '—'}
+                          </td>
+                          <td className={existingShift ? 'fw-semibold' : 'text-muted'}>
+                            {existingShift ? formatTime(existingShift.lastEndTime || existingShift.endTime) : '—'}
+                          </td>
+                          <td>
+                            {existingShift ? (
+                              <strong style={{ color: '#667eea', fontSize: '1.05rem' }}>{formatDuration(existingShift.totalDuration)} hrs</strong>
+                            ) : <span style={{ color: '#9CA3AF' }}>—</span>}
+                          </td>
+                          <td>
+                            {existingShift ? (
+                              <span className="badge" style={{
+                                background: existingShift.status === 'COMPLETED' ? '#06D6A0' : 
+                                           existingShift.status === 'ACTIVE' ? '#FF6B6B' : 
+                                           existingShift.status === 'DRAFT' ? '#FFE66D' : '#A8DADC',
+                                color: existingShift.status === 'DRAFT' ? '#2d3748' : 'white',
+                                fontWeight: '700',
+                                padding: '8px 16px'
+                              }}>
+                                {existingShift.status}
+                              </span>
+                            ) : <span className="badge" style={{ background: '#E5E7EB', color: '#6B7280', fontWeight: '600', padding: '6px 14px' }}>Pending</span>}
+                          </td>
+                          <td>
+                            {existingShift ? (
+                              <button 
+                                className={`btn btn-sm btn-shine ${
+                                  isCompleted ? 'btn-outline-success' : 'btn-primary'
+                                }`}
+                                onClick={() => handleEditShift(existingShift)}
+                                disabled={saving}
+                                style={{
+                                  borderRadius: '8px',
+                                  fontWeight: '600',
+                                  padding: '6px 16px'
+                                }}
+                              >
+                                <i className={`bi ${isCompleted ? 'bi-eye' : 'bi-pencil'} me-1`}></i>
+                                {isCompleted ? 'View' : 'Edit'}
+                              </button>
+                            ) : (
+                              <button 
+                                className="btn btn-sm btn-shine"
+                                style={{
+                                  background: 'linear-gradient(135deg, #00d9ff 0%, #0088cc 100%)',
+                                  border: 'none',
+                                  borderRadius: '6px',
+                                  fontWeight: '600',
+                                  padding: '6px 16px',
+                                  color: 'white'
+                                }}
+                                onClick={() => {
+                                  setEditingShift({ date: dateRow.date, shiftDate: dateRow.date, isNew: true });
+                                  setEditFormData({ firstStartTime: '', lastEndTime: '', shiftType: 'Regular' });
+                                }}
+                                disabled={saving}
+                              >
+                                <i className="bi bi-plus-circle me-1"></i>
+                                Add Shift
+                              </button>
+                            )}
+                          </td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              </div>
+            </>
+          )}
+        </div>
+      </div>
+
+      {/* Edit/Add Shift Modal */}
+      {editingShift && (
+        <div className="modal show d-block" style={{ backgroundColor: 'rgba(0,0,0,0.5)' }}>
+          <div className="modal-dialog modal-dialog-centered modal-lg">
+            <div className="modal-content">
+              <div className="modal-header">
+                <h5 className="modal-title">
+                  <i className={`bi ${editingShift.isNew ? 'bi-plus-circle' : 'bi-pencil-square'} me-2`}></i>
+                  {editingShift.isNew ? 'Add New Shift' : 'Edit Shift Times'}
+                </h5>
+                <button 
+                  type="button" 
+                  className="btn-close" 
+                  onClick={handleCancelEdit}
+                  disabled={saving}
+                ></button>
+              </div>
+              <div className="modal-body">
+                <div className="mb-3">
+                  <strong>Date:</strong> {formatDate(editingShift.shiftDate || editingShift.date)}
+                </div>
+                
+                <div className="row g-3">
+                  <div className="col-md-4">
+                    <label className="form-label">Shift Type</label>
+                    <select 
+                      className="form-select"
+                      value={editFormData.shiftType}
+                      onChange={(e) => setEditFormData({...editFormData, shiftType: e.target.value})}
+                      disabled={saving}
+                    >
+                      <option value="Regular">Regular</option>
+                      <option value="Overtime">Overtime</option>
+                      <option value="Night">Night Shift</option>
+                      <option value="Weekend">Weekend</option>
+                    </select>
+                  </div>
+                  
+                  <div className="col-md-4">
+                    <label className="form-label">Start Time</label>
+                    <input 
+                      type="time"
+                      className="form-control"
+                      value={editFormData.firstStartTime}
+                      onChange={(e) => setEditFormData({...editFormData, firstStartTime: e.target.value})}
+                      disabled={saving}
+                      required
+                    />
+                  </div>
+                  
+                  <div className="col-md-4">
+                    <label className="form-label">End Time</label>
+                    <input 
+                      type="time"
+                      className="form-control"
+                      value={editFormData.lastEndTime}
+                      onChange={(e) => setEditFormData({...editFormData, lastEndTime: e.target.value})}
+                      disabled={saving}
+                      required
+                    />
+                  </div>
+                </div>
+                
+                {editFormData.firstStartTime && editFormData.lastEndTime && (
+                  <div className="mt-3 p-3 bg-light rounded">
+                    <div className="d-flex justify-content-between align-items-center">
+                      <span>Calculated Duration:</span>
+                      <strong className="text-primary">
+                        {calculateDuration(editFormData.firstStartTime, editFormData.lastEndTime).toFixed(2)} hours
+                      </strong>
+                    </div>
+                  </div>
+                )}
+                
+                {/* Advanced Time Segment Entry */}
+                <div className="mt-3">
+                  <button 
+                    type="button" 
+                    className="btn btn-info btn-sm" 
+                    onClick={() => setShowAdvancedEdit(!showAdvancedEdit)}
+                    disabled={saving}
+                  >
+                    <i className="bi bi-gear me-1"></i>
+                    {showAdvancedEdit ? 'Hide Advanced Edit' : 'Advanced Edit (Time Segments)'}
+                  </button>
+                </div>
+
+                {showAdvancedEdit && (
+                  <div className="mt-3">
+                    <h6 className="text-primary">
+                      <i className="bi bi-gear me-2"></i>
+                      Advanced Time Segment Editor
+                    </h6>
+                    <div className="border rounded p-3 bg-light">
+                      <TimeSegmentEntry
+                        existingSegments={editingShift ? JSON.parse(editingShift.timeSegments || '[]') : []}
+                        onSubmit={handleSubmitTimeSegments}
+                        buttonText="Update Time Segments"
+                        submitButtonClass="btn-success"
+                        showSubmitButton={true}
+                        employeeName={editingShift?.employeeName}
+                        employeeId={editingShift?.employeeId}
+                        shiftDate={editingShift?.shiftDate || editingShift?.date}
+                        onCancel={() => setShowAdvancedEdit(false)}
+                      />
+                    </div>
+                  </div>
+                )}
+              </div>
+              <div className="modal-footer">
+                <button 
+                  type="button" 
+                  className="btn btn-secondary" 
+                  onClick={handleCancelEdit}
+                  disabled={saving}
+                >
+                  Cancel
+                </button>
+                <button 
+                  type="button" 
+                  className="btn btn-primary" 
+                  onClick={handleSaveEdit}
+                  disabled={saving || !editFormData.firstStartTime || !editFormData.lastEndTime}
+                >
+                  {saving ? (
+                    <>
+                      <span className="spinner-border spinner-border-sm me-2" role="status"></span>
+                      Saving...
+                    </>
+                  ) : (
+                    <>
+                      <i className="bi bi-check-lg me-1"></i>
+                      Save Changes
+                    </>
+                  )}
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
       )}
-
-      {renderShiftSummary()}
-
-      <Grid container spacing={2}>
-        <Grid item xs={12}>
-          <Paper sx={{ p: 2 }}>
-            <TimeSegmentEntry
-              onSubmit={handleSubmitTimeSegments}
-              currentShift={currentShift}
-              loading={loading}
-            />
-          </Paper>
-        </Grid>
-      </Grid>
-
-      {currentShift && currentShift.status === 'ACTIVE' && (
-        <Box mt={2}>
-          <Button
-            variant="contained"
-            color="primary"
-            onClick={handleCompleteShift}
-            disabled={loading}
-            startIcon={<Stop />}
-          >
-            Complete Shift
-          </Button>
-          <Button
-            variant="outlined"
-            color="secondary"
-            onClick={loadCurrentShiftStatus}
-            disabled={loading}
-            sx={{ ml: 2 }}
-          >
-            Refresh Sheet Data
-          </Button>
-        </Box>
-      )}
-
-      {(!currentShift || currentShift.status !== 'ACTIVE') && (
-        <Box mt={2}>
-          <Button
-            variant="outlined"
-            color="primary"
-            onClick={loadCurrentShiftStatus}
-            disabled={loading}
-          >
-            Refresh Sheet Data
-          </Button>
-        </Box>
-      )}
-
-      {loading && (
-        <Box display="flex" justifyContent="center" mt={2}>
-          <CircularProgress />
-        </Box>
-      )}
-    </Box>
+    </div>
   );
 };
 
